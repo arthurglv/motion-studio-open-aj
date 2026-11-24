@@ -1,0 +1,364 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SOTD motion scene</title>
+<style>
+  html,body{margin:0;background:#0b0b0d;display:grid;place-items:center;height:100%}
+  canvas{width:540px;height:675px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+</style>
+<canvas id="c" width="1080" height="1350"></canvas>
+<img id="bg" src="../post-bg.png" hidden>
+<img id="fl" src="../certificate-revelatio-studio-sotd.jpg" hidden>
+<script>
+const W = 1080, H = 1350, FPS = 60;
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+const bg = document.getElementById('bg');
+const fl = document.getElementById('fl');
+
+// Monitor screen centre inside post-bg.png — every card is born here so the
+// award reads as coming out of the site itself.
+const OX = 539, OY = 600;
+const CARD_AR = 3197 / 2410;
+
+const DURATIONS = { eruption: 6.0, marquee: 6.0, deal: 5.0 };
+
+/* ---------------- helpers ---------------- */
+const clamp = (v, a = 0, b = 1) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+const easeOutQuint = t => 1 - Math.pow(1 - t, 5);
+const easeInOutCubic = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const easeOutBack = (t, s = 1.5) => 1 + (s + 1) * Math.pow(t - 1, 3) + s * Math.pow(t - 1, 2);
+// window(t) -> 0..1 ramp between a and b
+const ramp = (t, a, b) => clamp((t - a) / (b - a));
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/** One flyer. yaw fakes a Y-axis spin by squashing horizontally. */
+function drawCard(o) {
+  const { x, y, w, rot = 0, yaw = 0, alpha = 1, shadow = 1, tint = 0 } = o;
+  if (alpha <= 0.002 || w <= 1) return;
+  const h = w * CARD_AR;
+  const cy = Math.cos(yaw);
+  const sx = Math.abs(cy) < 0.04 ? 0.04 * Math.sign(cy || 1) : cy;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+  ctx.transform(sx, 0, Math.sin(yaw) * 0.12, 1, 0, 0);
+  // Wide and faint rather than tight and dark: a big blur radius at low alpha
+  // reads as ambient occlusion under the card, not a hard drop shadow.
+  if (shadow > 0) {
+    ctx.shadowColor = 'rgba(0,0,0,' + (0.17 * shadow).toFixed(3) + ')';
+    ctx.shadowBlur = 44 + w * 0.20;
+    ctx.shadowOffsetY = 4 + w * 0.018;
+  }
+  ctx.drawImage(fl, -w / 2, -h / 2, w, h);
+  // depth tint: separates stacked cards without a drop shadow
+  if (tint > 0) {
+    ctx.shadowColor = 'transparent';
+    ctx.fillStyle = 'rgba(10,6,8,' + tint.toFixed(3) + ')';
+    ctx.fillRect(-w / 2, -h / 2, w, h);
+  }
+  ctx.restore();
+  // edge-on cards get a dark seam so the flip reads
+  if (Math.abs(cy) < 0.35) {
+    ctx.save();
+    ctx.globalAlpha = alpha * (1 - Math.abs(cy) / 0.35) * 0.5;
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(-w * Math.abs(sx) / 2, -h / 2, w * Math.abs(sx), h);
+    ctx.restore();
+  }
+}
+
+function drawBackground(t, dur, push = 0.055, shakeX = 0, shakeY = 0) {
+  if (SUPPRESS_BG) return;
+  const k = 1 + push * easeInOutCubic(clamp(t / dur));
+  const w = W * k, h = H * k;
+  ctx.drawImage(bg, (W - w) / 2 + shakeX, (H - h) / 2 + shakeY, w, h);
+}
+
+// Cover mode lays the plate and its vignette down itself, across the taller
+// canvas, then replays the variant for the cards alone. Both suppressions exist
+// for that: the scene's own 1350-tall vignette would seam at the extension, and
+// its background would paint over the vignette already down.
+let SUPPRESS_DIM = false;
+let SUPPRESS_BG = false;
+
+// A vignette, not a blackout: the mockup is a bright studio shot and crushing it
+// turns the whole frame muddy grey. Just enough falloff for the red to pop.
+function dim(a) {
+  if (SUPPRESS_DIM || a <= 0) return;
+  const g = ctx.createRadialGradient(W / 2, H * 0.46, H * 0.10, W / 2, H * 0.5, H * 0.80);
+  g.addColorStop(0, 'rgba(8,8,11,' + (a * 0.35).toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(8,8,11,' + a.toFixed(3) + ')');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// short white bloom on a landing — sells the impact at 60 fps
+function flash(t, at, amp = 0.10, len = 0.20) {
+  const k = 1 - clamp((t - at) / len);
+  if (t < at || k <= 0) return;
+  ctx.fillStyle = 'rgba(255,255,255,' + (amp * k * k).toFixed(4) + ')';
+  ctx.fillRect(0, 0, W, H);
+}
+
+/* ---------------- v1 · eruption ----------------
+   Flyers pour out of the monitor toward camera on an exponential dolly, then
+   one hero card decelerates into frame and holds. */
+function eruption(t) {
+  const DUR = DURATIONS.eruption;
+  drawBackground(t, DUR);
+  dim(0.24 * ramp(t, 0.45, 2.2));
+
+  const N = 26, LIFE = 1.75, LAST_BIRTH = 3.15;
+  const rnd = mulberry32(7);
+  const cards = [];
+  for (let i = 0; i < N; i++) {
+    const birth = 0.34 + i * 0.125;
+    const ang = i * 2.39996 + rnd() * 0.5;
+    const rot0 = (rnd() - 0.5) * 0.7;
+    const spin = (rnd() - 0.5) * 1.3;
+    const yawSpin = (rnd() - 0.5) * 4.2;
+    const rr = 0.78 + rnd() * 0.55;         // per-card outward reach
+    const sMax = 0.75 + rnd() * 0.85;       // per-card final size
+    if (birth > LAST_BIRTH) break;
+    const u = (t - birth) / LIFE;
+    if (u <= 0 || u >= 1) continue;
+    // exponential growth = dolly toward the lens
+    const g = (Math.pow(26, u) - 1) / 25;
+    const w = 660 * (0.045 + sMax * g);
+    const r = 1020 * rr * g;
+    const a = clamp(u / 0.10) * (1 - clamp((u - 0.80) / 0.20));
+    cards.push({
+      x: OX + Math.cos(ang) * r, y: OY + Math.sin(ang) * r * 0.86,
+      w, rot: rot0 + spin * u, yaw: yawSpin * u, alpha: a * 0.96,
+      vx: Math.cos(ang) * r, vy: Math.sin(ang) * r * 0.86, u,
+    });
+  }
+  cards.sort((a, b) => a.w - b.w);
+  // cheap per-card motion blur: two trailing samples along the outward vector
+  for (const cd of cards) {
+    const fast = clamp((cd.u - 0.45) / 0.4);
+    if (fast > 0.02) {
+      for (let s = 1; s <= 2; s++) {
+        const k = 1 - s * 0.055 * fast;
+        drawCard({
+          x: OX + (cd.x - OX) * k, y: OY + (cd.y - OY) * k,
+          w: cd.w * k, rot: cd.rot, yaw: cd.yaw,
+          alpha: cd.alpha * 0.16 * fast, shadow: 0,
+        });
+      }
+    }
+    drawCard(cd);
+  }
+
+  // Three stragglers brake out of the stream and stack up, so the frame still
+  // holds repeated flyers when the hero lands on top of them.
+  const HERO_AT = 3.60, LAND = 0.98;
+  const breathe = 1 + 0.012 * ramp(t, HERO_AT + LAND, DUR);
+  const settlers = [
+    { b: 2.95, dx: -156, dy: -46, rot: -0.22, w: 512 },
+    { b: 3.14, dx: 148, dy: 18, rot: 0.19, w: 528 },
+    { b: 3.33, dx: -18, dy: 74, rot: 0.07, w: 540 },
+  ];
+  for (const s of settlers) {
+    const u = clamp((t - s.b) / 1.02);
+    if (u <= 0) continue;
+    const e = easeOutQuint(u);
+    const g = (Math.pow(26, u) - 1) / 25;
+    drawCard({
+      x: lerp(OX, 540 + s.dx * breathe, e), y: lerp(OY, 690 + s.dy * breathe, e),
+      w: lerp(26, s.w, Math.max(e, g * 0.3)) * breathe,
+      rot: lerp(s.rot * 3.2, s.rot, easeOutBack(u, 1.1)), yaw: lerp(1.1, 0, e),
+      alpha: clamp(u / 0.08) * 0.98, shadow: 1,
+    });
+  }
+
+  // hero
+  const hu = clamp((t - HERO_AT) / LAND);
+  if (hu > 0) {
+    const e = easeOutQuint(hu);
+    const g = (Math.pow(26, hu) - 1) / 25;
+    const w = lerp(28, 588, Math.max(e, g * 0.32));
+    const settle = Math.sin(hu * Math.PI * 2.2) * (1 - hu) * (1 - hu) * 7;
+    drawCard({
+      x: lerp(OX, 540, e), y: lerp(OY, 690, e) + settle,
+      w: w * breathe, rot: lerp(-0.34, -0.03, easeOutBack(hu, 1.1)), yaw: lerp(1.5, 0, e),
+      alpha: clamp(hu / 0.08), shadow: 1.35,
+    });
+  }
+  flash(t, HERO_AT + LAND * 0.82, 0.09);
+}
+
+/* ---------------- v2 · marquee wall ----------------
+   Tilted columns of repeated flyers scroll past the mockup; a hero card rises
+   through them and locks centre. */
+function marquee(t) {
+  const DUR = DURATIONS.marquee;
+  drawBackground(t, DUR, 0.04);
+  dim(0.16 * ramp(t, 0.1, 1.2));
+
+  // Narrow cards on a wide pitch: the wall reads as repetition but the mockup
+  // still breathes through the gaps instead of being wallpapered over.
+  const CW = 322, CH = CW * CARD_AR, GAP = 188, PITCH = CH + GAP;
+  const cols = [
+    { x: -472, speed: 250, phase: 0.00, enter: 0.34 },
+    { x: 0, speed: 330, phase: 0.45, enter: 0.48 },
+    { x: 472, speed: 210, phase: 0.80, enter: 0.62 },
+  ];
+  const veil = ramp(t, 2.15, 3.05);
+
+  ctx.save();
+  ctx.translate(W / 2, H / 2);
+  ctx.rotate(-12 * Math.PI / 180);
+  ctx.filter = 'brightness(' + (1 - 0.34 * veil).toFixed(3) + ') saturate(' + (1 - 0.25 * veil).toFixed(3) + ')';
+  for (const col of cols) {
+    const inU = easeOutCubic(clamp((t - col.enter) / 0.95));
+    const slide = lerp(1500, 0, inU);
+    const off = ((t * col.speed + col.phase * PITCH) % PITCH + PITCH) % PITCH;
+    for (let i = -2; i <= 3; i++) {
+      const y = i * PITCH - off + slide;
+      if (y < -H || y > H * 1.4) continue;
+      drawCard({ x: col.x, y, w: CW, rot: 0, alpha: 0.98 * inU, shadow: 0.9 });
+    }
+  }
+  ctx.restore();
+
+  dim(0.30 * veil);
+
+  const HB = 2.45, HL = 1.05;
+  const hu = clamp((t - HB) / HL);
+  if (hu > 0) {
+    const e = easeOutBack(easeOutCubic(hu), 1.15);
+    const breathe = 1 + 0.012 * ramp(t, HB + HL, DUR);
+    drawCard({
+      x: 540, y: lerp(1620, 682, easeOutQuint(hu)),
+      w: lerp(380, 616, e) * breathe, rot: lerp(0.09, -0.02, easeOutQuint(hu)),
+      alpha: 1, shadow: 1.45,
+    });
+  }
+  flash(t, HB + HL * 0.72, 0.08);
+}
+
+/* ---------------- v3 · deal stack ----------------
+   Flyers are dealt in from off-frame and fan into a pile; the last one lands
+   square. Framing is locked: no frame shake, no background push-in and no
+   settle breathe, so the pile lands and simply holds. */
+function deal(t, depthTint = 0) {
+  const DUR = DURATIONS.deal;
+  const N = 12, STAG = 0.185, FLY = 0.68, T0 = 0.30;
+  const rnd = mulberry32(21);
+  const cards = [];
+  for (let i = 0; i < N; i++) {
+    const hero = i === N - 1;
+    cards.push({
+      birth: T0 + i * STAG,
+      rotEnd: hero ? -0.02 : (rnd() - 0.5) * 0.86,
+      dx: hero ? 0 : (rnd() - 0.5) * 150,
+      dy: hero ? 0 : (rnd() - 0.5) * 104,
+      w: hero ? 592 : 496 + rnd() * 54,
+      from: rnd() < 0.5 ? -1 : 1,
+      hero,
+    });
+  }
+
+  // Locked framing: no background push-in and no settle breathe, so the pile
+  // simply lands and holds instead of creeping toward the lens.
+  drawBackground(t, DUR, 0);
+  dim(0.16 * ramp(t, 0.2, 1.6) + 0.10 * ramp(t, 2.4, 3.4));
+
+  const breathe = 1;
+  for (let i = 0; i < cards.length; i++) {
+    const cd = cards[i];
+    const u = clamp((t - cd.birth) / FLY);
+    if (u <= 0) continue;
+    const e = easeOutQuint(u);
+    const ox = cd.from * 1500, oy = 1580;
+    const x = lerp(ox, 540 + cd.dx, e);
+    const y = lerp(oy, 664 + cd.dy, e);
+    const rot = lerp(cd.from * 0.95, cd.rotEnd, easeOutBack(u, 1.25));
+    const w = lerp(cd.w * 0.72, cd.w, e) * (u >= 1 ? breathe : 1);
+    drawCard({
+      x, y, w, rot, alpha: clamp(u / 0.10), shadow: cd.hero ? 1.35 : 1,
+      tint: depthTint * (1 - i / (N - 1)),
+    });
+  }
+  flash(t, T0 + (N - 1) * STAG + FLY * 0.86, 0.09);
+}
+
+/* ---------------- driver ---------------- */
+const VARIANTS = { eruption, marquee, deal, dealDepth: t => deal(t, 0.20) };
+DURATIONS.dealDepth = DURATIONS.deal;
+
+window.drawFrame = function (frame, variant) {
+  const fn = VARIANTS[variant];
+  const t = frame / FPS;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.filter = 'none';
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0b0b0d';
+  ctx.fillRect(0, 0, W, H);
+  fn(t);
+  return true;
+};
+window.frameCount = v => Math.round(DURATIONS[v] * FPS);
+
+/* ---------------- cover ----------------
+   The last frame of a variant, re-framed to a taller canvas. post-bg.png is
+   1080x1350, so the extra height comes from clamping its top and bottom rows
+   outward: the wall and the floor are smooth gradients, and a clamped edge
+   continues them without the kink a stretched band would leave. Scaling the
+   photo to cover 1080x1920 instead would crop 456px of width and cut the
+   monitor in half, which is why it is extended rather than zoomed. */
+window.drawCover = function (variant, opt) {
+  const o = opt || {};
+  const CH = o.height || 1920, CW = o.width || 1080;
+  const pad = (CH - H) / 2;
+  const top = Math.round(o.offsetY == null ? pad : o.offsetY);
+  const bottom = CH - H - top;
+  const t = (o.atSecond == null ? DURATIONS[variant] : o.atSecond);
+
+  c.width = CW; c.height = CH;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.filter = 'none';
+  ctx.clearRect(0, 0, CW, CH);
+
+  // plate: the photo at native size, extended by one clamped source row
+  if (top > 0) ctx.drawImage(bg, 0, 0, bg.naturalWidth, 1, 0, 0, CW, top + 1);
+  if (bottom > 0) {
+    ctx.drawImage(bg, 0, bg.naturalHeight - 1, bg.naturalWidth, 1,
+      0, CH - bottom - 1, CW, bottom + 1);
+  }
+  ctx.drawImage(bg, (CW - W) / 2, top, W, H);
+
+  // Vignette on the plate only, before the cards — same order as the animation.
+  // Painting it over the whole frame instead would tint the flyers and pull the
+  // awwwards red off its sRGB value.
+  const a = 0.26;
+  const g = ctx.createRadialGradient(CW / 2, CH * 0.48, CH * 0.10, CW / 2, CH * 0.5, CH * 0.78);
+  g.addColorStop(0, 'rgba(8,8,11,' + (a * 0.30).toFixed(3) + ')');
+  g.addColorStop(1, 'rgba(8,8,11,' + a.toFixed(3) + ')');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, CW, CH);
+
+  SUPPRESS_DIM = SUPPRESS_BG = true;
+  ctx.save();
+  ctx.translate((CW - W) / 2, top);
+  VARIANTS[variant](t);
+  ctx.restore();
+  SUPPRESS_DIM = SUPPRESS_BG = false;
+  return { width: CW, height: CH, top, bottom };
+};
+window.ready = Promise.all([bg.decode(), fl.decode()]).then(() => true);
+</script>
